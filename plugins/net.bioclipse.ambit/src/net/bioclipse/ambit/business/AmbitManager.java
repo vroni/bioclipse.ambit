@@ -11,6 +11,11 @@
  ******************************************************************************/
 package net.bioclipse.ambit.business;
 
+import java.io.File;
+import java.io.IOException;
+import java.io.InputStream;
+import java.net.MalformedURLException;
+import java.net.URL;
 import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
@@ -20,6 +25,18 @@ import net.bioclipse.cdk.domain.ICDKMolecule;
 import net.bioclipse.core.business.BioclipseException;
 import net.bioclipse.core.domain.IMolecule;
 import net.bioclipse.managers.business.IBioclipseManager;
+import net.idea.opentox.cli.InvalidInputException;
+import net.idea.opentox.cli.OTClient;
+import net.idea.opentox.cli.Resources;
+import net.idea.opentox.cli.dataset.Dataset;
+import net.idea.opentox.cli.dataset.DatasetClient;
+import net.idea.opentox.cli.dataset.InputData;
+import net.idea.opentox.cli.dataset.Rights;
+import net.idea.opentox.cli.dataset.Rights._type;
+import net.idea.opentox.cli.structure.Compound;
+import net.idea.opentox.cli.structure.CompoundClient;
+import net.idea.opentox.cli.structure.CompoundClient.QueryType;
+import net.idea.opentox.cli.task.RemoteTask;
 
 import org.apache.log4j.Logger;
 import org.openscience.cdk.exception.CDKException;
@@ -33,20 +50,25 @@ import org.openscience.cdk.isomorphism.mcss.RMap;
 import org.openscience.cdk.qsar.DescriptorValue;
 import org.openscience.cdk.qsar.result.DoubleResult;
 import org.openscience.cdk.qsar.result.IntegerArrayResult;
+import org.opentox.rest.RestException;
 
 import ambit2.descriptors.FunctionalGroupDescriptor;
 import ambit2.descriptors.PKASmartsDescriptor;
 import ambit2.descriptors.VerboseDescriptorResult;
 import ambit2.smarts.SmartsParser;
 
-public class AmbitManager implements IBioclipseManager {
+public class AmbitManager<POLICY_RULE> implements IBioclipseManager {
 
     private static final Logger logger = Logger.getLogger(AmbitManager.class);
     private static final SmartsParser smartsParser = new SmartsParser();
+    public final static OTClient otclient = new OTClient();
     private final PKASmartsDescriptor pkaDescriptor = new PKASmartsDescriptor();
     private final FunctionalGroupDescriptor oecdDescriptor = new FunctionalGroupDescriptor();
+    private final String db_location = "http://localhost:8080/ambit2-www-2.4.11";
 
+    //FIXME get manager from Spring instead
     private CDKManager cdk = new CDKManager();
+    private List<URL> uri;
 
     /**
      * Gives a short one word name of the manager used as variable name when
@@ -55,7 +77,117 @@ public class AmbitManager implements IBioclipseManager {
     public String getManagerName() {
         return "ambit";
     }
+    
+    /**
+     * Find structure in DB from exact inChi String. Exact structure search relies on inChi representation.
+     * @param inchi  String representing chemical structure which is looked up.
+     * @return  URI with identifier where component was found. Null if exception was thrown.
+     * @throws IOException 
+     * @throws RestException 
+     * @throws MalformedURLException 
+     */
+    public String findExactStructure(String inchi) throws MalformedURLException, RestException, IOException {
+    	CompoundClient<POLICY_RULE> cli = otclient.getCompoundClient();
+    	uri = cli.searchExactStructuresURI(new URL(db_location), inchi, QueryType.inchikey, false);
+    	return uri.toString();
+    }
+    
+    /**
+     * Finds structures similar to the given one in the database. Enter a threshold that represents the degree
+     * of similarity.
+     * @param smiles  String representing the chemical where a similar one is supposed to be found.
+     * @param threshold  double representing the similarity of the two compounds.
+     * @return  List of URIs with identifiers for found structures.
+     * @throws IOException 
+     * @throws RestException 
+     * @throws MalformedURLException 
+     */
+    public String findSimilarStructure(String smiles, double threshold) throws MalformedURLException, RestException, IOException {
+    	CompoundClient<POLICY_RULE> cli = otclient.getCompoundClient();
+    	uri = cli.searchSimilarStructuresURI(new URL(db_location), smiles, QueryType.smiles, false, threshold);
+    	return uri.toString();
+    }
 
+    /**
+     * Runs a substructure search in the db using the given term.
+     * @param term  String representing substructure
+     * @return  List of URIs containing components that include the substructure.
+     * @throws MalformedURLException
+     * @throws RestException
+     * @throws IOException
+     */
+    public String substructureSearch(String term) throws MalformedURLException, RestException, IOException {
+    	CompoundClient<POLICY_RULE> cli = otclient.getCompoundClient();
+    	uri = cli.searchSubstructuresURI(new URL(db_location), term);
+    	return uri.toString();
+    }
+    
+    /**
+     * Adds a new compound to the db.
+     * @param cas  CAS of the component.
+     * @param name String representing name of the component.
+     * @param sMILES  SMILES string of the component.
+     * @return Message printed after action.
+     * @throws MalformedURLException
+     * @throws InvalidInputException
+     * @throws Exception
+     */
+    public String addComponent(String cas, String name, String sMILES) throws MalformedURLException, InvalidInputException, Exception {
+    	otclient.setHTTPBasicCredentials("localhost", 8080,"admin", "changeit");
+    	CompoundClient<POLICY_RULE> cli = otclient.getCompoundClient();
+		Compound substance = new Compound();
+		
+		// More properties can be added to the compound.
+		substance.setCas(cas);
+		substance.setName(name);
+		substance.setSMILES(sMILES);
+    	RemoteTask task = cli.registerSubstanceAsync(new URL(db_location), substance,"TEST_ID","12345");
+    	task.waitUntilCompleted(500);
+		return task.getResult().toString();
+    }
+    
+    /**
+     * Load data into db from a file. File location has to be given with exact path. Rights are set by default
+     * to "http://creativecommons.org/licenses/by-sa/2.0/". FIXME use of exact path is discouraged!
+     * @param filename  String representing filename of file to be loaded. Needs to be exact path!!!
+     * @param title  String representing title of dataset.
+     * @throws Exception 
+     */
+    public String loadData(String filename, String title) throws Exception {
+    	otclient.setHTTPBasicCredentials("localhost", 8080,"admin", "changeit");
+
+		File fileToImport = new File(filename);
+		Dataset dataset = new Dataset();
+		dataset.getMetadata().setTitle(title);
+		dataset.getMetadata().setRights(new Rights("CC-BY-SA","http://creativecommons.org/licenses/by-sa/2.0/",_type.license));
+		dataset.setInputData(new InputData(fileToImport,DatasetClient._MATCH.InChI));
+		DatasetClient<POLICY_RULE> otClient = otclient.getDatasetClient();
+		RemoteTask task = otClient.postAsync(dataset,new URL(String.format("%s%s", db_location, Resources.dataset)));
+		task.waitUntilCompleted(1000);
+		return task.getResult().toString();
+    }
+    
+    /**
+     * Display information of compound as string.
+     * @param id  int representing id of desired compound
+     * @throws MalformedURLException
+     * @throws Exception
+     */
+    public String displayComponent(int id) throws MalformedURLException, Exception {
+    	CompoundClient<POLICY_RULE> otClient = otclient.getCompoundClient();
+		//get the first record
+		List<Compound> substances = otClient.getIdentifiersAndLinks(
+				new URL(String.format("%s", db_location)),
+				new URL(String.format("%s%s/1", db_location, Resources.compound))
+				);	
+		StringBuilder str = new StringBuilder();
+		for (Compound s : substances) {
+			str.append(s.getName() + ", " + s.getSMILES());
+			str.append("\n");
+		}
+		return str.toString();
+    }
+    
     public double calculatePKa(IMolecule molecule) throws BioclipseException {
     	logger.debug("Calculate the pKa");
     	ICDKMolecule cdkMol = cdk.asCDKMolecule(molecule);
